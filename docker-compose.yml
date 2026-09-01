@@ -1,0 +1,51 @@
+services:
+  minecraft:
+    build:
+      context: .
+      dockerfile: docker/minecraft.Dockerfile
+    container_name: minecraft
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      MINECRAFT_RCON_PASSWORD: ${MINECRAFT_RCON_PASSWORD:?Copy .env.example to .env and set MINECRAFT_RCON_PASSWORD}
+    ports:
+      - "25565:25565"
+    volumes:
+      - ./server:/data
+    mem_limit: 3g
+    cpus: 2.0
+
+  panel:
+    build:
+      context: .
+      dockerfile: docker/panel.Dockerfile
+    container_name: minecraft-panel
+    restart: unless-stopped
+    environment:
+      PANEL_ADMIN_PASSWORD: ${PANEL_ADMIN_PASSWORD:?Copy .env.example to .env and set PANEL_ADMIN_PASSWORD}
+      PANEL_HOST: 0.0.0.0
+      MINECRAFT_RCON_PASSWORD: ${MINECRAFT_RCON_PASSWORD:?Copy .env.example to .env and set MINECRAFT_RCON_PASSWORD}
+      MINECRAFT_HOST: minecraft
+      MINECRAFT_CONTAINER: minecraft
+      MINECRAFT_RCON_PORT: 25575
+      MINECRAFT_DIR: /app/server
+      LOG_FILE: /minecraft-logs/latest.log
+      DATA_FILE: /panel-data/.panel-users.json
+      PUBLIC_DIR: /app/dist
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./server:/app/server
+      - ./scripts:/app/scripts:ro
+      - ./server/logs:/minecraft-logs:ro
+      - panel-data:/panel-data
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - minecraft
+    mem_limit: 512m
+    cpus: 1.0
+
+volumes:
+  panel-data:

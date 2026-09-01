@@ -1,0 +1,10 @@
+# Copy this file to server.properties or run scripts/setup.sh.
+level-name=world
+enable-rcon=true
+rcon.password=replace-with-MINECRAFT_RCON_PASSWORD
+rcon.port=25575
+server-port=25565
+motd=A Minecraft Server
+gamemode=survival
+difficulty=easy
+online-mode=false
