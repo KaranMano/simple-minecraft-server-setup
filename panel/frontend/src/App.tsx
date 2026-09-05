@@ -49,6 +49,10 @@ const METRICS_WINDOW_MS = 5 * 60 * 1000;
 type MetricSample = { timestamp: number; cpuPercent: number; cpuCores: number; memoryUsedMb: number; memoryLimitMb: number };
 type MetricsResponse = { intervalMs: number; windowMs: number; oldestTimestamp: number | null; latestTimestamp: number | null; reset: boolean; points: MetricSample[] };
 type MetricPoint = { time: number; elapsed: number; series: string; value: number };
+function trimMetrics(history: MetricSample[], latestTimestamp: number) {
+  const cutoff = latestTimestamp - METRICS_WINDOW_MS;
+  return history.filter(point => point.timestamp >= cutoff);
+}
 function toSeries(history: MetricSample[], windowStart: number): MetricPoint[] {
   const points: MetricPoint[] = [];
   for (const point of history) {
@@ -90,8 +94,9 @@ function Shell({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (val
     const since = metricsCursor.current;
     const query = since === undefined ? '' : `?since=${since}`;
     const response = await request<MetricsResponse>(`/api/metrics${query}`);
-    if (since === undefined || response.reset) setMetricsHistory(response.points);
-    else if (response.points.length) setMetricsHistory(history => [...history, ...response.points.filter(point => point.timestamp > (history.at(-1)?.timestamp || 0))]);
+    const latestTimestamp = response.latestTimestamp ?? Date.now();
+    if (since === undefined || response.reset) setMetricsHistory(trimMetrics(response.points, latestTimestamp));
+    else if (response.points.length) setMetricsHistory(history => trimMetrics([...history, ...response.points.filter(point => point.timestamp > (history.at(-1)?.timestamp || 0))], latestTimestamp));
     metricsCursor.current = response.latestTimestamp ?? metricsCursor.current;
   };
   const refresh = async () => {
@@ -300,8 +305,9 @@ function MetricsChart({ history }: { history: MetricSample[] }) {
   const {
     token: { colorTextSecondary, colorBorderSecondary, colorBgContainer, colorText },
   } = theme.useToken();
-  // Anchor the window to the first sample so the graph grows from the left (0s) toward 10m.
-  const windowStart = history.length ? history[0].timestamp : Date.now();
+  const firstTimestamp = history[0]?.timestamp ?? Date.now();
+  const windowEnd = history.at(-1)?.timestamp ?? firstTimestamp;
+  const windowStart =  Math.max(firstTimestamp, windowEnd - METRICS_WINDOW_MS);    
   const data = toSeries(history, windowStart);
   const latestSample = history.at(-1);
   const latest = (series: string) => {
@@ -324,6 +330,7 @@ function MetricsChart({ history }: { history: MetricSample[] }) {
           autoFit
           smooth
           animation={false}
+          animate={false}
           point={false}
           scale={{ x: { domain: [0, METRICS_WINDOW_MS] }, y: { domain: [0, 100] }, color: { domain: ['CPU', 'Memory'], range: [SERIES_COLORS.CPU, SERIES_COLORS.Memory] } }}
           area={{ style: { fillOpacity: 0.18 } }}
