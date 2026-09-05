@@ -17,14 +17,12 @@ const PORT = Number(process.env.PANEL_PORT || 8787);
 const HOST = process.env.PANEL_HOST || '127.0.0.1';
 const JAVA_HOME = process.env.JAVA_HOME || '';
 const JAVA_COMMAND = JAVA_HOME ? path.join(JAVA_HOME, 'bin', 'java') : 'java';
-const MINECRAFT_HOST = process.env.MINECRAFT_HOST || '';
-const MINECRAFT_CONTAINER = process.env.MINECRAFT_CONTAINER || 'minecraft';
-const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const LOG_FILE = process.env.LOG_FILE || path.join(MINECRAFT_DIR, 'logs', 'latest.log');
 const BACKUP_DIR = path.join(MINECRAFT_DIR, 'backups');
 const BACKUP_WARNING_SECONDS = Number(process.env.BACKUP_WARNING_SECONDS || 10);
-const METRICS_INTERVAL_MS = Number(process.env.METRICS_INTERVAL_MS || 3000);
+const METRICS_INTERVAL_MS = Number(process.env.METRICS_INTERVAL_MS || 1000);
 const METRICS_WINDOW_MS = Number(process.env.METRICS_WINDOW_MS || 5 * 60 * 1000);
+const MINECRAFT_MEMORY_LIMIT_MB = Number(process.env.MINECRAFT_MEMORY_LIMIT_MB || 2048);
 const SESSION_TTL = 24 * 60 * 60 * 1000;
 const FEATURE_KEYS = ['server.control', 'server.console', 'server.metrics', 'server.rcon', 'server.backups', 'users.manage'];
 const COMMAND_CATALOG = [
@@ -40,8 +38,10 @@ let logBuffer = '';
 let lifecycleOperation = null;
 let rconOperation = null;
 const metricsHistory = [];
+const metricsClients = new Set();
 let metricsSampleInProgress = false;
 let metricsTimer = null;
+let processMetricsState = null;
 
 function log(level, event, details = {}) {
     console.log(JSON.stringify({ time: new Date().toISOString(), level, event, details }));
@@ -101,32 +101,20 @@ function startServer() {
     return true;
 }
 function stopServer() {
-    if (MINECRAFT_HOST) return dockerContainerAction('stop').then(() => true);
     if (!processInfo().running) return false;
     if (minecraftProcess?.exitCode === null) minecraftProcess.stdin.write('stop\n'); else rcon('stop').catch(() => { });
     return true;
 }
-function dockerRequest(method, requestPath) {
-    return new Promise((resolve, reject) => {
-        const request = require('http').request({ socketPath: DOCKER_SOCKET, path: `/v1.44${requestPath}`, method }, response => {
-            let data = ''; response.setEncoding('utf8'); response.on('data', chunk => { data += chunk; });
-            response.on('end', () => { let parsed; try { parsed = data ? JSON.parse(data) : {}; } catch { parsed = data; } response.statusCode >= 400 ? reject(new Error(parsed.message || `Docker API returned ${response.statusCode}`)) : resolve(parsed); });
-        });
-        request.on('error', reject); request.end();
-    });
-}
-function dockerContainerAction(action) { return dockerRequest('POST', `/containers/${encodeURIComponent(MINECRAFT_CONTAINER)}/${action}`); }
-async function dockerStatus() { try { const info = await dockerRequest('GET', `/containers/${encodeURIComponent(MINECRAFT_CONTAINER)}/json`); return { running: !!info.State?.Running, pid: info.State?.Pid || 0, owned: false }; } catch { return { running: false }; } }
 function rcon(command) {
     if (rconOperation) return Promise.reject(new Error('Another RCON command is already in progress.'));
     const properties = fs.existsSync(path.join(MINECRAFT_DIR, 'server.properties')) ? fs.readFileSync(path.join(MINECRAFT_DIR, 'server.properties'), 'utf8') : '';
     const get = key => properties.match(new RegExp(`^${key}=(.*)$`, 'm'))?.[1] || '';
-    if (!MINECRAFT_HOST && get('enable-rcon') !== 'true') return Promise.reject(new Error('RCON is disabled in server.properties.'));
+    if (get('enable-rcon') !== 'true') return Promise.reject(new Error('RCON is disabled in server.properties.'));
     const password = process.env.MINECRAFT_RCON_PASSWORD || get('rcon.password').replace(/\\!/g, '!');
     const port = Number(process.env.MINECRAFT_RCON_PORT || get('rcon.port') || 25575);
-    log('info', 'rcon.started', { host: MINECRAFT_HOST || '127.0.0.1', port });
+    log('info', 'rcon.started', { host: '127.0.0.1', port });
     rconOperation = new Promise((resolve, reject) => {
-        const client = new Rcon(MINECRAFT_HOST || '127.0.0.1', port, password, { tcp: true });
+        const client = new Rcon('127.0.0.1', port, password, { tcp: true });
         let settled = false;
         const timer = setTimeout(() => finish(new Error('RCON timed out.')), 5000);
         const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); try { client.disconnect(); } catch { } error ? reject(error) : resolve(value); };
@@ -139,14 +127,31 @@ function rcon(command) {
     return rconOperation.finally(() => { log('info', 'rcon.finished'); rconOperation = null; });
 }
 async function metrics() {
-    if (MINECRAFT_HOST) {
-        const info = await dockerRequest('GET', `/containers/${encodeURIComponent(MINECRAFT_CONTAINER)}/stats?stream=false`);
-        const cpuDelta = info.cpu_stats?.cpu_usage?.total_usage - info.precpu_stats?.cpu_usage?.total_usage || 0;
-        const systemDelta = info.cpu_stats?.system_cpu_usage - info.precpu_stats?.system_cpu_usage || 0;
-        return { server: await dockerStatus(), minecraftMemory: Math.round((info.memory_stats?.usage || 0) / 1024 / 1024), minecraftMemoryLimit: Math.round((info.memory_stats?.limit || 0) / 1024 / 1024), minecraftCpu: systemDelta ? Number(((cpuDelta / systemDelta) * (info.cpu_stats?.online_cpus || 1) * 100).toFixed(1)) : 0, minecraftCpuCores: info.cpu_stats?.online_cpus || os.cpus().length };
-    }
     let disk = 'unavailable'; try { disk = await run('du', ['-sh', MINECRAFT_DIR]); } catch { }
-    return { hostMemory: Math.round((1 - os.freemem() / os.totalmem()) * 100), nodeMemory: Math.round(process.memoryUsage().rss / 1024 / 1024), load: Number(os.loadavg()[0].toFixed(2)), disk, server: processInfo() };
+    const server = processInfo();
+    let minecraftCpu = 0;
+    let minecraftMemory = 0;
+    if (server.running && server.pid) {
+        try {
+            const stat = fs.readFileSync(`/proc/${server.pid}/stat`, 'utf8');
+            const statFields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+            const cpuTicks = Number(statFields[11]) + Number(statFields[12]);
+            const now = Date.now();
+            if (processMetricsState?.pid === server.pid) {
+                const elapsedSeconds = (now - processMetricsState.timestamp) / 1000;
+                const tickRate = Number(process.env.PROC_TICK_RATE || 100);
+                if (elapsedSeconds > 0) minecraftCpu = Number(((cpuTicks - processMetricsState.cpuTicks) / tickRate / elapsedSeconds * 100).toFixed(1));
+            }
+            processMetricsState = { pid: server.pid, cpuTicks, timestamp: now };
+            const status = fs.readFileSync(`/proc/${server.pid}/status`, 'utf8');
+            minecraftMemory = Number(status.match(/^VmRSS:\s+(\d+)\s+kB$/m)?.[1] || 0) / 1024;
+        } catch {
+            processMetricsState = null;
+        }
+    } else {
+        processMetricsState = null;
+    }
+    return { hostMemory: Math.round((1 - os.freemem() / os.totalmem()) * 100), nodeMemory: Math.round(process.memoryUsage().rss / 1024 / 1024), load: Number(os.loadavg()[0].toFixed(2)), disk, server, minecraftCpu, minecraftCpuCores: os.cpus().length, minecraftMemory: Math.round(minecraftMemory), minecraftMemoryLimit: MINECRAFT_MEMORY_LIMIT_MB };
 }
 async function sampleMetrics() {
     if (metricsSampleInProgress) return;
@@ -154,8 +159,12 @@ async function sampleMetrics() {
     try {
         const result = await metrics();
         const timestamp = Date.now();
-        if (result.minecraftCpu === undefined && result.minecraftMemory === undefined) return;
-        metricsHistory.push({ timestamp, cpuPercent: result.minecraftCpu ?? 0, cpuCores: result.minecraftCpuCores || 0, memoryUsedMb: result.minecraftMemory ?? 0, memoryLimitMb: result.minecraftMemoryLimit ?? 0 });
+        const point = { timestamp, cpuPercent: result.minecraftCpu ?? 0, cpuCores: result.minecraftCpuCores || 0, memoryUsedMb: result.minecraftMemory ?? 0, memoryLimitMb: result.minecraftMemoryLimit ?? 0 };
+        metricsHistory.push(point);
+        const payload = `event: metric\ndata: ${JSON.stringify(point)}\n\n`;
+        for (const response of metricsClients) {
+            try { response.write(payload); } catch { metricsClients.delete(response); }
+        }
         const cutoff = timestamp - METRICS_WINDOW_MS;
         while (metricsHistory.length && metricsHistory[0].timestamp < cutoff) metricsHistory.shift();
     } catch (error) {
@@ -183,7 +192,7 @@ function backupList() {
 }
 function nextBackupAt() { const next = new Date(); next.setHours(4, 0, 0, 0); if (next <= new Date()) next.setDate(next.getDate() + 1); return next; }
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-async function waitForStopped() { for (let attempt = 0; attempt < 30; attempt += 1) { if (!(await dockerStatus()).running) return; await wait(1000); } throw new Error('Minecraft did not stop in time.'); }
+async function waitForStopped() { for (let attempt = 0; attempt < 30; attempt += 1) { if (!processInfo().running) return; await wait(1000); } throw new Error('Minecraft did not stop in time.'); }
 async function runLifecycle(type, task) {
     if (lifecycleOperation) throw new Error(`A ${lifecycleOperation.type} operation is already in progress.`);
     lifecycleOperation = { type, phase: 'starting', startedAt: new Date().toISOString() }; log('info', `${type}.started`);
@@ -193,29 +202,28 @@ async function runLifecycle(type, task) {
 async function lifecycleAction(type, action) {
     return runLifecycle(type, async operation => {
         operation.phase = `${type} server`;
-        if (MINECRAFT_HOST) return dockerContainerAction(action);
         if (type === 'start') return startServer(); if (type === 'stop') return stopServer(); await stopServer(); await wait(4000); return startServer();
     });
 }
 async function backupWithLifecycle() {
     return runLifecycle('backup', async operation => {
-        operation.phase = 'checking server'; const wasRunning = MINECRAFT_HOST ? (await dockerStatus()).running : processInfo().running;
+        operation.phase = 'checking server'; const wasRunning = processInfo().running;
         if (wasRunning) {
-            operation.phase = 'sending warning'; if (MINECRAFT_HOST) await rcon(`say Server backup begins in ${BACKUP_WARNING_SECONDS} seconds. Please finish what you are doing.`); else if (minecraftProcess?.stdin.writable) minecraftProcess.stdin.write(`say Server backup begins in ${BACKUP_WARNING_SECONDS} seconds. Please finish what you are doing.\n`);
+            operation.phase = 'sending warning'; if (minecraftProcess?.stdin.writable) minecraftProcess.stdin.write(`say Server backup begins in ${BACKUP_WARNING_SECONDS} seconds. Please finish what you are doing.\n`);
             operation.phase = 'waiting for warning'; await wait(BACKUP_WARNING_SECONDS * 1000);
-            operation.phase = 'stopping server'; if (MINECRAFT_HOST) { await dockerContainerAction('stop'); await waitForStopped(); } else await stopServer();
+            operation.phase = 'stopping server'; await stopServer(); await waitForStopped();
         }
         try { operation.phase = 'creating archive'; return await backup(); }
-        finally { if (wasRunning) { operation.phase = 'starting server'; if (MINECRAFT_HOST) await dockerContainerAction('start'); else startServer(); } }
+        finally { if (wasRunning) { operation.phase = 'starting server'; startServer(); } }
     });
 }
 async function restoreBackup(name) {
     return runLifecycle('restore', async operation => {
         operation.phase = 'validating backup'; if (!/^world_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.tar\.gz$/.test(name || '')) throw new Error('Invalid backup name.');
-        const wasRunning = MINECRAFT_HOST ? (await dockerStatus()).running : processInfo().running;
-        if (wasRunning) { operation.phase = 'stopping server'; if (MINECRAFT_HOST) { await rcon('say Server is shutting down to restore a backup.'); await dockerContainerAction('stop'); await waitForStopped(); } else await stopServer(); }
+        const wasRunning = processInfo().running;
+        if (wasRunning) { operation.phase = 'stopping server'; if (minecraftProcess?.stdin.writable) minecraftProcess.stdin.write('say Server is shutting down to restore a backup.\n'); await stopServer(); await waitForStopped(); }
         try { operation.phase = 'restoring world'; return await run('/usr/bin/bash', [BACKUP_SCRIPT, 'restore', name], { timeout: 0 }); }
-        finally { if (wasRunning) { operation.phase = 'starting server'; if (MINECRAFT_HOST) await dockerContainerAction('start'); else startServer(); } }
+        finally { if (wasRunning) { operation.phase = 'starting server'; startServer(); } }
     });
 }
 function scheduleBackup() { const next = nextBackupAt(); setTimeout(async () => { try { await backupWithLifecycle(); } catch (error) { log('error', 'backup.scheduled.failed', { error: error.message }); } scheduleBackup(); }, next.getTime() - Date.now()); }
@@ -234,8 +242,8 @@ app.post('/api/login', (req, res) => {
 app.use('/api', requireAuth);
 app.get('/api/status', async (req, res) => {
     const result = {};
-    result.server = MINECRAFT_HOST ? await dockerStatus() : processInfo();
-    if (can(req.user, 'server.console')) result.logs = MINECRAFT_HOST && fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, 'utf8').slice(-120000) : logBuffer;
+    result.server = processInfo();
+    if (can(req.user, 'server.console')) result.logs = fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, 'utf8').slice(-120000) : logBuffer;
     if (can(req.user, 'server.backups')) Object.assign(result, { backups: backupList(), nextBackup: nextBackupAt().toISOString() });
     result.lifecycle = lifecycleOperation ? { ...lifecycleOperation } : null; res.json(result);
 });
@@ -244,16 +252,27 @@ app.get('/api/metrics', requirePermission('server.metrics'), (req, res) => {
     if (rawSince !== undefined && (!/^\d+$/.test(String(rawSince)) || !Number.isSafeInteger(Number(rawSince)))) return res.status(400).json({ error: 'since must be a Unix timestamp in milliseconds.' });
     res.json(metricsResponse(rawSince === undefined ? undefined : Number(rawSince)));
 });
+app.get('/api/metrics/stream', requirePermission('server.metrics'), (req, res) => {
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    });
+    res.write(': connected\n\n');
+    metricsClients.add(res);
+    req.on('close', () => metricsClients.delete(res));
+});
 app.get('/api/commands', (req, res) => res.json({ commands: COMMAND_CATALOG.filter(command => can(req.user, command.permission)) }));
 app.post('/api/logout', (req, res) => { if (req.cookies.panel_session) sessions.delete(req.cookies.panel_session); res.clearCookie('panel_session', { path: '/' }); res.status(204).end(); });
 for (const action of ['start', 'stop', 'restart']) app.post(`/api/server/${action}`, requirePermission('server.control'), async (req, res) => { if (lifecycleOperation) return busy(res); await lifecycleAction(action, action); res.json({ ok: true }); });
 app.post('/api/command', async (req, res) => {
     if (!can(req.user, 'server.console') && !can(req.user, 'server.rcon')) return res.status(403).json({ error: 'Permission denied.' });
     const definition = COMMAND_CATALOG.find(command => command.id === req.body.id && can(req.user, command.permission)); if (!definition) return res.status(400).json({ error: 'Command is not available for this account.' });
-    if (MINECRAFT_HOST && rconOperation) return res.status(409).json({ error: 'Another RCON command is already in progress.' });
+    if (rconOperation) return res.status(409).json({ error: 'Another RCON command is already in progress.' });
     const values = req.body.values || {}; if (definition.fields.some(field => field.required && !String(values[field.name] || '').trim())) return res.status(400).json({ error: 'All required command fields must be filled.' });
     const command = definition.command || definition.template.replace(/\{(\w+)\}/g, (_, name) => String(values[name] || '').trim().replace(/[\r\n]/g, ' '));
-    const output = MINECRAFT_HOST ? await rcon(command) : (processInfo().running ? (minecraftProcess.stdin.write(`${command}\n`), '') : ''); res.json({ ok: true, command, output });
+    const output = processInfo().running ? (minecraftProcess.stdin.write(`${command}\n`), '') : ''; res.json({ ok: true, command, output });
 });
 app.post('/api/rcon', requirePermission('server.rcon'), async (req, res) => { if (rconOperation) return res.status(409).json({ error: 'Another RCON command is already in progress.' }); res.json({ output: await rcon(req.body.command || '') }); });
 app.post('/api/backup', requirePermission('server.backups'), async (req, res) => { if (lifecycleOperation) return busy(res); res.json({ output: await backupWithLifecycle(), backups: backupList() }); });
@@ -274,5 +293,7 @@ app.use(express.static(PUBLIC_DIR, { index: false }));
 app.use((req, res) => req.url.startsWith('/api/') ? res.status(404).json({ error: 'Not found.' }) : res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
 app.use((error, req, res, next) => { log('error', 'api.failed', { path: req.url, error: error.message }); if (!res.headersSent) res.status(500).json({ error: error.message }); });
 
-ensureUserStore(); startMetricsSampler(); scheduleBackup();
+ensureUserStore();
+try { startServer(); } catch (error) { log('error', 'server.process.startup.failed', { error: error.message }); }
+startMetricsSampler(); scheduleBackup();
 app.listen(PORT, HOST, () => log('info', 'panel.listening', { host: HOST, port: PORT }));

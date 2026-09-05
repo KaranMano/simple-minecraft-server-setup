@@ -36,12 +36,22 @@ type Status = { server?: { running: boolean; pid?: number }; logs?: string; back
 
 const featureNames: Record<string, string> = { 'server.control': 'Lifecycle', 'server.console': 'Console', 'server.metrics': 'Metrics', 'server.rcon': 'RCON', 'server.backups': 'Backups', 'users.manage': 'Users' };
 
+class TransientFetchError extends Error {}
+
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', 'X-Panel-Poll': 'true', ...(options.headers || {}) } });
+  let response: Response;
+  try {
+    response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', 'X-Panel-Poll': 'true', ...(options.headers || {}) } });
+  } catch {
+    // The fetch itself was aborted or the connection dropped (e.g. the
+    // The Paper process may briefly disappear during a restart. This is transient, not a user error.
+    throw new TransientFetchError('Server is restarting');
+  }
   const data = response.status === 204 ? {} : await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || 'Request failed');
   return data;
 }
+const isTransient = (error: unknown) => error instanceof TransientFetchError;
 const formatDate = (value?: string) => value ? new Date(value).toLocaleString() : 'Not scheduled';
 const formatSize = (bytes = 0) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 
@@ -90,6 +100,13 @@ function Shell({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (val
   const metricsCursor = useRef<number | undefined>(undefined);
   const [loaded, setLoaded] = useState(false);
   const { message } = AntApp.useApp();
+  const appendMetric = (point: MetricSample) => {
+    setMetricsHistory(history => {
+      if (history.some(item => item.timestamp === point.timestamp)) return history;
+      return trimMetrics([...history, point], point.timestamp);
+    });
+    metricsCursor.current = point.timestamp;
+  };
   const fetchMetrics = async () => {
     const since = metricsCursor.current;
     const query = since === undefined ? '' : `?since=${since}`;
@@ -115,9 +132,13 @@ function Shell({ darkMode, setDarkMode }: { darkMode: boolean; setDarkMode: (val
   };
   useEffect(() => {
     if (!session) metricsCursor.current = undefined;
-    refresh().catch(error => { message.error(error.message); setLoaded(true); });
-    const timer = setInterval(() => session && Promise.all([request<Status>('/api/status'), fetchMetrics()]).then(([nextStatus]) => setStatus(nextStatus)).catch(() => { }), 3000);
-    return () => clearInterval(timer);
+    refresh().catch(error => { if (!isTransient(error)) message.error(error.message); setLoaded(true); });
+    const timer = setInterval(() => session && request<Status>('/api/status').then(nextStatus => setStatus(nextStatus)).catch(() => { }), 3000);
+    const stream = session ? new EventSource('/api/metrics/stream') : null;
+    stream?.addEventListener('metric', event => {
+      try { appendMetric(JSON.parse((event as MessageEvent).data) as MetricSample); } catch { }
+    });
+    return () => { clearInterval(timer); stream?.close(); };
   }, [session?.username]);
   if (!loaded) return <Flex justify="center" align="center" style={{ minHeight: '100vh' }}><Spin size="large" /></Flex>;
   if (!session) return <Login onLogin={setSession} darkMode={darkMode} setDarkMode={setDarkMode} />;
@@ -174,13 +195,14 @@ function Dashboard({ session, status, commands, users, metricsHistory, refresh, 
   const has = (key: string) => session.permissions.includes(key);
   const operation = status.lifecycle;
   const online = !!status.server?.running;
-  const action = async (fn: () => Promise<any>, success: string) => {
+  const action = async (fn: () => Promise<any>, success: string, refreshAfter = true) => {
     try {
       const result = await fn();
       message.success(result.output || success);
-      await refresh();
+      if (refreshAfter) await refresh();
     } catch (error) {
-      message.error((error as Error).message);
+      if (isTransient(error)) message.info('Server is restarting; status will update shortly.');
+      else message.error((error as Error).message);
     }
   };
   return (
@@ -213,7 +235,7 @@ function Dashboard({ session, status, commands, users, metricsHistory, refresh, 
                     key={name}
                     danger={name === 'stop'}
                     disabled={!!operation}
-                    onClick={() => action(() => request(`/api/server/${name}`, { method: 'POST' }), `${name} completed`)}
+                    onClick={() => action(() => request(`/api/server/${name}`, { method: 'POST' }), `${name} completed`, name !== 'restart')}
                   >
                     {name}
                   </Button>
@@ -227,13 +249,14 @@ function Dashboard({ session, status, commands, users, metricsHistory, refresh, 
             <Card title="World safety" style={{ width: '100%' }}>
               <Typography.Paragraph type="secondary">Next automatic backup: {formatDate(status.nextBackup)}</Typography.Paragraph>
               {operation && (
-                <Flex vertical gap="small">
+                <Flex vertical gap="small" style={{ marginBottom: 16 }}>
                   <Typography.Text strong>{operation.type}: {operation.phase}</Typography.Text>
-                  <Progress percent={100} status="active" showInfo={false} />
+                  <Progress percent={100} status="active" showInfo={false} style={{ margin: '4px 0 8px' }} />
                 </Flex>
               )}
               <Button
                 disabled={!!operation}
+                style={{ marginBottom: 16 }}
                 onClick={() => action(() => request('/api/backup', { method: 'POST' }), 'Backup completed')}
               >
                 Create backup
