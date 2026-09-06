@@ -65,3 +65,8 @@ To stop the stack:
 ```sh
 docker compose down
 ```
+
+
+## Example Panel
+
+![Minecraft control panel example](screenshots/example.png)
