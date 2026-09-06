@@ -3,8 +3,7 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "cookie-parser": "latest",

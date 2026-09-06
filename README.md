@@ -1,9 +1,9 @@
 # Minecraft Server Setup and Panel
 
-This repository provides a Paper Minecraft server setup, Docker deployment, backup scripts, and an optional web control panel. The panel manages the Paper server in `server/` and is split into `panel/backend` (Express API) and `panel/frontend` (React and Ant Design). It stores salted password hashes in the configured `DATA_FILE`.
+This repository provides a Paper Minecraft server setup, Docker deployment, backup scripts, and an optional web control panel. The panel manages the Paper server in `server/` and is split into `panel/backend` and `panel/frontend`. It stores salted password hashes in the configured `DATA_FILE`.
 
 ## First run
-
+    
 Install dependencies, build the frontend, and start the backend:
 
 ```sh
@@ -28,11 +28,9 @@ docker compose down -v
 docker compose up -d --build
 ```
 
-`JAVA_HOME` is optional. When set, the panel starts Paper with `${JAVA_HOME}/bin/java`; otherwise it uses `java` from `PATH`. The panel starts Paper with `-Xms1G -Xmx2G`, sends lifecycle commands through the process console, uses the existing local RCON settings, and invokes `scripts/backup.sh` for backups and restores. It operates on the `server/world/` directory.
+`JAVA_HOME` is optional. When set, the panel starts Paper with `${JAVA_HOME}/bin/java`; otherwise it uses `java` from `PATH`. The panel sends lifecycle commands through the process console, uses the existing local RCON settings, and invokes `scripts/backup.sh` for backups and restores. It operates on the `server/world/` directory.
 
-Run the syntax check with `npm run check`.
-
-Backups are timestamped world archives in `server/backups/`. A manual or scheduled backup announces itself in-game, stops Paper, creates the archive, and starts Paper again when it was running. The panel keeps the newest three archives, shows the next backup at 04:00 local time, and can restore an archive; the current world is moved to a timestamped `world_before_restore_*` directory first.
+Backups are timestamped world archives in `server/backups/`. A manual or scheduled backup(04:00 local time) announces itself in-game, stops Paper, creates the archive, and starts Paper again when it was running. The panel keeps the newest three archives and can restore an archive; the current world is moved to a timestamped `world_before_restore_*` directory first.
 
 ## Docker Compose
 
@@ -51,7 +49,7 @@ Install `curl` and `jq`, accept the [Minecraft EULA](https://www.minecraft.net/e
 EULA=true ./scripts/setup.sh
 ```
 
-The setup script downloads the latest stable Paper build for Minecraft `26.2` by default. Override `PAPER_VERSION`, `PAPER_BUILD`, or `PAPER_URL` when selecting another Paper release. To use an existing world, stop the stack, place the world directory under `server/`, and make sure its directory name matches `level-name` in `server/server.properties` (for example, set `level-name=my-world` and place it at `server/my-world/`). Leave the directory absent to let Paper generate a new world on first start.
+The setup script downloads the latest stable Paper build for Minecraft `26.2` by default. Override `PAPER_VERSION`, `PAPER_BUILD`, or `PAPER_URL` when selecting another Paper release. To use an existing world, stop the server, place the world directory under `server/`, and make sure its directory name matches `level-name` in `server/server.properties` (for example, set `level-name=my-world` and place it at `server/my-world/`). Leave the directory absent to let Paper generate a new world on first start.
 
 Copy `.env.example` to `.env`, replace both placeholder passwords, and start the combined container:
 
@@ -60,11 +58,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-The combined `minecraft-panel` container runs both Node and Java as the unprivileged UID/GID `1000:1000`. Its image creates and owns the application directories and the named `panel-data` volume; no init container or Docker socket is required. The existing `./server` bind mount is used for the Paper jar, world, logs, and backups, so its files must be writable by UID 1000.
-
-The RCON password is injected into `server.properties` by the combined container at startup, so it must match `MINECRAFT_RCON_PASSWORD` in `.env`. Do not commit `.env`, `server/server.properties`, the Paper jar, worlds, backups, logs, or generated server metadata; the root `.gitignore` covers these paths. Keep `scripts/backup.sh` tracked because the panel uses it for backups and restores.
-
-The combined container publishes Minecraft on port 25565 and the panel locally at http://127.0.0.1:8787. The panel starts and controls the Java Paper process directly; there is no Docker API integration, Docker socket mount, proxy, or init container. Keep the panel bound to localhost and protect its credentials, especially before exposing it to other users or networks.
+The admin console is accessible on port 8787 and the server is accessible on port 25565 once the docker container is running.
 
 To stop the stack:
 

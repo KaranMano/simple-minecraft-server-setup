@@ -15,7 +15,7 @@ services:
       DATA_FILE: /panel-data/.panel-users.json
       PUBLIC_DIR: /app/dist
     ports:
-      - "127.0.0.1:8787:8787"
+      - "8787:8787"
       - "25565:25565"
     volumes:
       - ./server:/app/server
